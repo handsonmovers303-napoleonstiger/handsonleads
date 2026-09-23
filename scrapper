@@ -1,0 +1,139 @@
+name: HandsOn Lead Scraper
+
+on:
+  # Run every 2 hours automatically
+  schedule:
+    - cron: '0 */2 * * *'
+
+  # Also allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Which source to run (leave blank for all)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - forsale
+          - trinity
+          - houses
+          - apartments
+          - storage_tri
+          - triggers
+          - noaa
+          - craigslist
+          - reddit
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run HandsOn Scraper
+        run: |
+          SOURCE="${{ github.event.inputs.source }}"
+          if [ -n "$SOURCE" ]; then
+            echo "Running source: $SOURCE"
+            timeout 25m node ventures-scraper.js --once --source "$SOURCE" || true
+          else
+            echo "Running all sources"
+            timeout 25m node ventures-scraper.js --once || true
+          fi
+
+      - name: Show results
+        run: |
+          node -e "
+          const fs = require('fs');
+          if (!fs.existsSync('leads.json')) {
+            console.log('No leads.json generated');
+            process.exit(0);
+          }
+          const d = JSON.parse(fs.readFileSync('leads.json','utf8'));
+          const s = d.stats || {};
+          const l = d.leads || [];
+          console.log('');
+          console.log('═══════════════════════════════════════');
+          console.log('  HANDSON SCRAPE RESULTS');
+          console.log('═══════════════════════════════════════');
+          console.log('  Total leads:  ', l.length);
+          console.log('  Pipeline:     \$' + (s.pipeline||0).toLocaleString());
+          console.log('  Critical:     ', s.critical||0);
+          console.log('  Hot:          ', s.hot||0);
+          console.log('  With phone:   ', s.with_phone||0);
+          console.log('');
+          console.log('  TOP CRITICAL LEADS:');
+          l.filter(x=>x.priority==='CRITICAL').slice(0,10).forEach(x=>{
+            const ph = x.phone ? '📞 ' : '   ';
+            console.log(' ', ph + '[' + x.score + '] \$' + (x.revenue||0).toLocaleString().padStart(7) + ' ' + x.title.slice(0,60));
+          });
+          console.log('');
+          console.log('  BY TRADE:');
+          const bt = s.by_trade || {};
+          Object.entries(bt)
+            .filter(([,v])=>v.total>0)
+            .sort(([,a],[,b])=>b.pipeline-a.pipeline)
+            .forEach(([t,v])=>{
+              console.log('   ', t.padEnd(14), v.total + ' leads  \$' + (v.pipeline||0).toLocaleString());
+            });
+          console.log('═══════════════════════════════════════');
+          "
+
+      - name: Upload leads as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: handson-leads-${{ github.run_number }}
+          path: leads.json
+          retention-days: 7
+
+      - name: Send SMS alert for CRITICAL leads (optional)
+        if: env.TWILIO_SID != ''
+        env:
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          TWILIO_TO: ${{ secrets.TWILIO_TO }}
+        run: |
+          node -e "
+          const fs = require('fs');
+          if (!fs.existsSync('leads.json')) process.exit(0);
+          const d = JSON.parse(fs.readFileSync('leads.json','utf8'));
+          const critical = (d.leads||[]).filter(x=>x.priority==='CRITICAL');
+          if (critical.length === 0) { console.log('No critical leads'); process.exit(0); }
+
+          const https = require('https');
+          const msg = [
+            'HandsOn CRITICAL: ' + critical.length + ' leads',
+            '\$' + (d.stats?.pipeline||0).toLocaleString() + ' pipeline',
+            critical.slice(0,3).map(l=>l.title.slice(0,50)).join(' | ')
+          ].join(' — ');
+
+          const body = 'Body=' + encodeURIComponent(msg) +
+            '&From=' + encodeURIComponent(process.env.TWILIO_FROM) +
+            '&To='   + encodeURIComponent(process.env.TWILIO_TO);
+
+          const auth = Buffer.from(process.env.TWILIO_SID + ':' + process.env.TWILIO_TOKEN).toString('base64');
+          const req = https.request({
+            hostname: 'api.twilio.com',
+            path: '/2010-04-01/Accounts/' + process.env.TWILIO_SID + '/Messages.json',
+            method: 'POST',
+            headers: {
+              'Authorization': 'Basic ' + auth,
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Content-Length': Buffer.byteLength(body)
+            }
+          }, r => console.log('SMS sent, status:', r.statusCode));
+          req.on('error', e => console.log('SMS error:', e.message));
+          req.write(body);
+          req.end();
+          "
